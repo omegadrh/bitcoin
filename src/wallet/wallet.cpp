@@ -3792,22 +3792,56 @@ bool CWallet::MigrateToSQLite(bilingual_str& error)
         return false;
     }
 
-    // Close this database and delete the file
-    fs::path db_path = fs::PathFromString(m_database->Filename());
+    // Close this database and move the file aside so it can be put back if the new database cannot be created.
+    const std::string db_filename{m_database->Filename()};
+    const fs::path db_path{fs::PathFromString(db_filename)};
+    const fs::path legacy_db_path{fs::PathFromString(db_filename + ".migrating.bak")};
+    if (fs::exists(legacy_db_path)) {
+        error = strprintf(_("Error: Unable to migrate the wallet because %s already exists. It may have been left behind by an earlier migration attempt. Move or remove it and try again."), fs::PathToString(legacy_db_path));
+        return false;
+    }
     m_database->Close();
-    fs::remove(db_path);
+    if (!RenameOver(db_path, legacy_db_path)) {
+        error = strprintf(_("Error: Unable to move the wallet file %s aside for migration"), fs::PathToString(db_path));
+        return false;
+    }
 
     // Generate the path for the location of the migrated wallet
     // Wallets that are plain files rather than wallet directories will be migrated to be wallet directories.
     const fs::path wallet_path = fsbridge::AbsPathJoin(GetWalletDir(), fs::PathFromString(m_name));
+    const bool wallet_path_existed{fs::exists(wallet_path)};
 
     // Make new DB
     DatabaseOptions opts;
     opts.require_create = true;
     opts.require_format = DatabaseFormat::SQLITE;
     DatabaseStatus db_status;
-    std::unique_ptr<WalletDatabase> new_db = MakeDatabase(wallet_path, opts, db_status, error);
-    assert(new_db); // This is to prevent doing anything further with this wallet. The original file was deleted, but a backup exists.
+    bilingual_str db_error;
+    std::unique_ptr<WalletDatabase> new_db = MakeDatabase(wallet_path, opts, db_status, db_error);
+    if (!new_db) {
+        // Remove the files the failed attempt may have created (see SQLiteDatabase::Files()).
+        // Anything other than a regular file at these paths was not created by SQLite, so leave it alone.
+        const fs::path new_db_file{SQLiteDataFile(wallet_path)};
+        const fs::path new_journal_file{fs::PathFromString(fs::PathToString(new_db_file) + "-journal")};
+        for (const fs::path& file : {new_db_file, new_journal_file}) {
+            std::error_code ec;
+            if (fs::is_regular_file(file, ec)) fs::remove(file, ec);
+        }
+        if (!wallet_path_existed) {
+            // The wallet directory was created for the new database. This only removes it if it is empty.
+            std::error_code ec;
+            fs::remove(wallet_path, ec);
+        }
+
+        error = strprintf(_("Error: Unable to create the SQLite database for the migrated wallet: %s"), db_error) + Untranslated(" ") +
+                _("Check that the wallet directory is writable and on a filesystem that supports file locking (network filesystems such as SMB/CIFS or NFS may not).");
+        if (RenameOver(legacy_db_path, db_path)) {
+            error += Untranslated(" ") + _("The wallet has not been changed.");
+        } else {
+            error += Untranslated(" ") + strprintf(_("The original wallet file could not be moved back to %s and is at %s."), fs::PathToString(db_path), fs::PathToString(legacy_db_path));
+        }
+        return false;
+    }
     m_database.reset();
     m_database = std::move(new_db);
 
@@ -3825,6 +3859,12 @@ bool CWallet::MigrateToSQLite(bilingual_str& error)
     }
     bool committed = batch->TxnCommit();
     assert(committed); // This is a critical error, the new db could not be written to. The original db exists as a backup, but we should not continue execution.
+
+    // The records are now in the new database, so the original file is no longer needed
+    std::error_code ec;
+    if (!fs::remove(legacy_db_path, ec)) {
+        WalletLogPrintf("Warning: Unable to remove the original wallet file %s after migration: %s", fs::PathToString(legacy_db_path), ec.message());
+    }
     return true;
 }
 

@@ -1083,6 +1083,42 @@ class WalletMigrationTest(BitcoinTestFramework):
         # Check the wallet we tried to migrate is still BDB
         self.assert_is_bdb("failed")
 
+    def test_sqlite_creation_failure(self):
+        self.log.info("Test that failing to create the SQLite database leaves the legacy wallet unchanged")
+        wallet_name = "sqlite_create_fail"
+        wallet = self.create_legacy_wallet(wallet_name)
+        wallet.unloadwallet()
+        wallet_dir = self.master_node.wallets_path / wallet_name
+        shutil.copytree(self.old_node.wallets_path / wallet_name, wallet_dir)
+        wallet_file = wallet_dir / "wallet.dat"
+        original_shasum = sha256sum_file(wallet_file)
+
+        # A file left behind by an earlier migration attempt is not overwritten
+        leftover_file = wallet_dir / "wallet.dat.migrating.bak"
+        leftover_file.touch()
+        assert_raises_rpc_error(-4, "wallet.dat.migrating.bak already exists", self.master_node.migratewallet, wallet_name)
+        leftover_file.unlink()
+        assert_equal(sha256sum_file(wallet_file), original_shasum)
+
+        # Make creating the SQLite database fail by putting a directory where its journal file would go.
+        # Migrating twice also checks that a failed attempt leaves nothing behind that blocks a retry.
+        journal_dir = wallet_dir / "wallet.dat-journal"
+        journal_dir.mkdir()
+        assert_raises_rpc_error(-4, "Unable to create the SQLite database for the migrated wallet", self.master_node.migratewallet, wallet_name)
+        assert_raises_rpc_error(-4, "The wallet has not been changed.", self.master_node.migratewallet, wallet_name)
+
+        assert wallet_name not in self.master_node.listwallets()
+        assert_equal(sha256sum_file(wallet_file), original_shasum)
+        assert not leftover_file.exists()
+        # SQLite did not create the directory, so it is left alone
+        assert journal_dir.is_dir()
+
+        # Once the obstruction is removed, migration succeeds
+        journal_dir.rmdir()
+        self.master_node.migratewallet(wallet_name)
+        self.assert_is_sqlite(wallet_name)
+        assert not leftover_file.exists()
+
     def test_blank(self):
         self.log.info("Test that a blank wallet is migrated")
         wallet = self.create_legacy_wallet("blank", blank=True)
@@ -1785,6 +1821,7 @@ class WalletMigrationTest(BitcoinTestFramework):
         self.test_conflict_txs()
         self.test_hybrid_pubkey()
         self.test_failed_migration_cleanup()
+        self.test_sqlite_creation_failure()
         self.test_avoidreuse()
         self.test_preserve_tx_extra_info()
         self.test_blank()
